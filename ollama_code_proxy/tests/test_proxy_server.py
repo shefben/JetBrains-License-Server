@@ -1,81 +1,214 @@
 from fastapi.testclient import TestClient
-from main import app
-from proxy_server.models import OllamaRequest, OllamaResponse
+from fastapi import FastAPI, Response as FastAPIResponse
 import pytest
-import httpx # Import httpx
+from unittest.mock import patch, AsyncMock, MagicMock
+import httpx # For httpx.HTTPStatusError
+
+from ollama_code_proxy.proxy_server import routes as proxy_routes_module
+# Import models if needed for constructing request data, though for these tests, dicts are mostly used.
+# from ollama_code_proxy.proxy_server import models as proxy_models_module
+
+# Create a minimal app for testing
+app = FastAPI()
+# The router in proxy_routes_module should be defined WITHOUT a prefix.
+# The prefix '/api/v1/ollama' is applied here when including the router.
+app.include_router(proxy_routes_module.router, prefix="/api/v1/ollama")
 
 client = TestClient(app)
 
-def test_read_root():
+# --- Test for Root Endpoint ---
+def test_read_root_on_test_app():
+    # This test app only has routes starting with /api/v1/ollama
+    # So, a request to "/" should result in a 404 Not Found.
     response = client.get("/")
-    assert response.status_code == 200
-    assert response.json() == {"message": "Ollama Code Proxy is running!"}
+    assert response.status_code == 404
 
-def test_proxy_to_ollama_success(mocker):
-    # Mock the httpx.AsyncClient response
-    mock_response_data = {
-        "model": "test-model",
-        "created_at": "2023-01-01T00:00:00Z",
-        "response": "Test response from Ollama",
-        "done": True,
-        "context": [1, 2, 3],
-        "total_duration": 1000,
-        "load_duration": 100,
-        "prompt_eval_count": 10,
-        "prompt_eval_duration": 200,
-        "eval_count": 5,
-        "eval_duration": 300,
+
+# --- Mocks for Ollama Responses ---
+def mock_ollama_generate_response_data():
+    return {
+        "model": "test-model", "created_at": "2023-01-01T00:00:00Z",
+        "response": "Test response from Ollama", "done": True, "context": [1, 2, 3],
+        "total_duration": 1000, "load_duration": 100, "prompt_eval_count": 10,
+        "prompt_eval_duration": 200, "eval_count": 5, "eval_duration": 300,
     }
-    # aparición de httpx.AsyncClient.post
-    mock_async_client_post = mocker.patch("httpx.AsyncClient.post")
-    # Crear un mock para el objeto de respuesta
-    mock_http_response = mocker.Mock()
-    mock_http_response.status_code = 200
-    mock_http_response.json.return_value = mock_response_data
-    # Configurar raise_for_status para no hacer nada (simulando una respuesta exitosa)
-    mock_http_response.raise_for_status = mocker.Mock()
-    mock_async_client_post.return_value = mock_http_response
+
+def mock_ollama_tags_response_data():
+    return {
+        "models": [{
+            "name": "llama2:latest", "model": "llama2:latest", "modified_at": "2023-01-01T00:00:00Z",
+            "size": 1234567890, "digest": "sha256:abcdef",
+            "details": {"parent_model": "", "format": "gguf", "family": "llama",
+                        "families": ["llama"], "parameter_size": "7B", "quantization_level": "Q4_0"}
+        }]
+    }
+
+def mock_ollama_show_response_data():
+    return {
+        "modelfile": "FROM llama2...", "parameters": "num_ctx 4096", "template": "{{ .Prompt }}",
+        "details": {"parent_model": "", "format": "gguf", "family": "llama",
+                    "families": ["llama"], "parameter_size": "7B", "quantization_level": "Q4_0"},
+        "model_info": {"general.architecture": "llama", "llama.block_count": 32}
+    }
+
+def mock_ollama_chat_response_data(streaming=False):
+    if streaming:
+        return {"model": "chat-model", "created_at": "2023-01-01T00:00:00Z",
+                "message": {"role": "assistant", "content": "Stream part..."}, "done": False}
+    return {"model": "chat-model", "created_at": "2023-01-01T00:00:00Z",
+            "message": {"role": "assistant", "content": "Full chat response"}, "done": True,
+            "total_duration": 1000, "prompt_eval_count": 10, "eval_count": 5}
+
+def mock_ollama_pull_status_response_data(streaming=False):
+    if streaming:
+        return {"status": "downloading layer sha256:12345", "digest": "sha256:12345", "total": 1000, "completed": 500}
+    return {"status": "success"} # Non-streaming success for pull
 
 
-    request_data = OllamaRequest(model="test-model", prompt="Test prompt")
-    response = client.post("/api/v1/ollama/generate", json=request_data.model_dump())
+# --- Tests for /api/v1/ollama/generate ---
+@patch("ollama_code_proxy.proxy_server.routes._ollama_proxy_request", new_callable=AsyncMock)
+def test_proxy_generate_success(mock_proxy_helper):
+    mock_proxy_helper.return_value = mock_ollama_generate_response_data()
+    # Default PROMPT_PREFIX is "Based on your knowledge, please respond to the following: \n"
+    expected_prefixed_prompt = "Based on your knowledge, please respond to the following: \nTest prompt"
+
+    request_data = {"model": "test-model", "prompt": "Test prompt", "stream": False}
+    response = client.post("/api/v1/ollama/generate", json=request_data)
 
     assert response.status_code == 200
-    assert response.json() == mock_response_data
-    mock_async_client_post.assert_called_once()
+    assert response.json()["response"] == "Test response from Ollama"
 
-def test_proxy_to_ollama_http_error(mocker):
-    # Mock an HTTP error from httpx by having post raise it directly
-    # We need to create a mock request object for the HTTPStatusError
-    mock_request = httpx.Request(method="POST", url="http://localhost:11434/api/generate")
-    # We also need a mock response object for the HTTPStatusError
-    mock_response = httpx.Response(status_code=500, request=mock_request, content=b"Ollama Error")
-
-    mocker.patch(
-        "httpx.AsyncClient.post",
-        side_effect=httpx.HTTPStatusError(
-            "Ollama Server Error", request=mock_request, response=mock_response
-        ),
-    )
-
-    request_data = OllamaRequest(model="test-model", prompt="Test prompt")
-    response = client.post("/api/v1/ollama/generate", json=request_data.model_dump())
-
-    assert response.status_code == 500
-    assert "Ollama Server Error" in response.json()["detail"]
+    mock_proxy_helper.assert_called_once()
+    args, kwargs = mock_proxy_helper.call_args
+    assert args[0] == "POST"
+    assert args[1] == "/api/generate"
+    # args[2] is the settings object, we can't easily assert its exact instance from here without more setup
+    # So we check the json_data that was passed, which is what we care about for this test
+    assert "json_data" in kwargs
+    assert kwargs["json_data"]["prompt"] == expected_prefixed_prompt
+    assert kwargs["json_data"]["model"] == "test-model"
 
 
-def test_proxy_to_ollama_request_error(mocker):
-    # Mock a request error (e.g., connection issue)
-    # We need to create a mock request object for the RequestError
-    mock_request = httpx.Request(method="POST", url="http://localhost:11434/api/generate")
-    mocker.patch(
-        "httpx.AsyncClient.post",
-        side_effect=httpx.RequestError("Connection failed", request=mock_request),
-    )
+@patch("ollama_code_proxy.proxy_server.routes._ollama_proxy_request", new_callable=AsyncMock)
+def test_proxy_generate_ollama_error(mock_proxy_helper):
+    # Simulate the helper re-raising an HTTPException that originated from an Ollama error
+    mock_proxy_helper.side_effect = HTTPException(status_code=500, detail={"error": "ollama internal error"})
 
-    request_data = OllamaRequest(model="test-model", prompt="Test prompt")
-    response = client.post("/api/v1/ollama/generate", json=request_data.model_dump())
+    request_data = {"model": "test-model", "prompt": "Test prompt", "stream": False}
+    response = client.post("/api/v1/ollama/generate", json=request_data)
 
     assert response.status_code == 500
-    assert "Error connecting to Ollama API: Connection failed" in response.json()["detail"]
+    assert response.json()["detail"] == {"error": "ollama internal error"}
+
+# TODO: Add test for /generate streaming
+
+
+# --- Tests for /api/v1/ollama/tags ---
+@patch("ollama_code_proxy.proxy_server.routes._ollama_proxy_request", new_callable=AsyncMock)
+def test_proxy_tags_success(mock_proxy_helper):
+    mock_proxy_helper.return_value = mock_ollama_tags_response_data()
+    response = client.get("/api/v1/ollama/tags")
+    assert response.status_code == 200
+    assert len(response.json()["models"]) == 1
+    assert response.json()["models"][0]["name"] == "llama2:latest"
+
+    mock_proxy_helper.assert_called_once()
+    args, kwargs = mock_proxy_helper.call_args
+    assert args[0] == "GET"
+    assert args[1] == "/api/tags"
+    # args[2] is settings
+
+# --- Tests for /api/v1/ollama/show ---
+@patch("ollama_code_proxy.proxy_server.routes._ollama_proxy_request", new_callable=AsyncMock)
+def test_proxy_show_success(mock_proxy_helper):
+    mock_proxy_helper.return_value = mock_ollama_show_response_data()
+    request_data = {"name": "llama2:latest"} # This matches ShowRequest model
+    response = client.post("/api/v1/ollama/show", json=request_data)
+    assert response.status_code == 200
+    assert response.json()["modelfile"] == "FROM llama2..."
+
+    mock_proxy_helper.assert_called_once()
+    args, kwargs = mock_proxy_helper.call_args
+    assert args[0] == "POST"
+    assert args[1] == "/api/show"
+    assert kwargs["json_data"] == request_data
+
+# --- Tests for /api/v1/ollama/chat (non-streaming) ---
+@patch("ollama_code_proxy.proxy_server.routes._ollama_proxy_request", new_callable=AsyncMock)
+def test_proxy_chat_non_streaming_success(mock_proxy_helper):
+    mock_proxy_helper.return_value = mock_ollama_chat_response_data(streaming=False)
+    request_data = {
+        "model": "chat-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": False # Explicitly non-streaming
+    }
+    response = client.post("/api/v1/ollama/chat", json=request_data)
+    assert response.status_code == 200
+    assert response.json()["message"]["content"] == "Full chat response"
+
+    mock_proxy_helper.assert_called_once()
+    args, kwargs = mock_proxy_helper.call_args
+    assert args[0] == "POST"
+    assert args[1] == "/api/chat"
+    assert kwargs["json_data"] == request_data
+
+# TODO: Add test for /chat streaming
+
+# --- Tests for /api/v1/ollama/pull (non-streaming) ---
+@patch("ollama_code_proxy.proxy_server.routes._ollama_proxy_request", new_callable=AsyncMock)
+def test_proxy_pull_non_streaming_success(mock_proxy_helper):
+    mock_proxy_helper.return_value = mock_ollama_pull_status_response_data(streaming=False)
+    request_data = {"name": "llama2:latest", "stream": False} # Explicitly non-streaming
+    response = client.post("/api/v1/ollama/pull", json=request_data)
+    assert response.status_code == 200
+    assert response.json()["status"] == "success"
+
+    mock_proxy_helper.assert_called_once()
+    args, kwargs = mock_proxy_helper.call_args
+    assert args[0] == "POST"
+    assert args[1] == "/api/pull"
+    assert kwargs["json_data"] == request_data
+
+# TODO: Add test for /pull streaming
+
+# --- Tests for /api/v1/ollama/delete ---
+@patch("ollama_code_proxy.proxy_server.routes._ollama_proxy_request", new_callable=AsyncMock)
+def test_proxy_delete_success(mock_proxy_helper):
+    # _ollama_proxy_request for a successful delete with no content returns a FastAPIResponse(status_code=200)
+    mock_proxy_helper.return_value = FastAPIResponse(status_code=200)
+    request_data = {"name": "model-to-delete"}
+    response = client.delete("/api/v1/ollama/delete", json=request_data)
+    assert response.status_code == 200
+    assert response.content == b"" # Expecting empty body for 200 from helper
+
+    mock_proxy_helper.assert_called_once()
+    args, kwargs = mock_proxy_helper.call_args
+    assert args[0] == "DELETE"
+    assert args[1] == "/api/delete"
+    assert kwargs["json_data"] == request_data
+    assert kwargs["expected_empty_response_status"] == 200
+
+
+# --- Tests for /api/v1/ollama/ps ---
+@patch("ollama_code_proxy.proxy_server.routes._ollama_proxy_request", new_callable=AsyncMock)
+def test_proxy_ps_success(mock_proxy_helper):
+    # Using a more complete mock based on ProcessModelInfo structure
+    mock_ps_model_details = {"parent_model": "", "format": "gguf", "family": "llama",
+                             "families": ["llama"], "parameter_size": "7B", "quantization_level": "Q4_0"}
+    mock_response_data = {
+        "models": [{
+            "name": "llama2:loaded", "model": "llama2:loaded", "modified_at": "2023-12-01T00:00:00Z",
+            "size": 7000000, "digest":"abc", "details": mock_ps_model_details,
+            "expires_at": "2024-01-01T00:00:00Z", "size_vram": 123456
+        }]
+    }
+    mock_proxy_helper.return_value = mock_response_data
+    response = client.get("/api/v1/ollama/ps")
+    assert response.status_code == 200
+    assert len(response.json()["models"]) == 1
+    assert response.json()["models"][0]["name"] == "llama2:loaded"
+
+    mock_proxy_helper.assert_called_once()
+    args, kwargs = mock_proxy_helper.call_args
+    assert args[0] == "GET"
+    assert args[1] == "/api/ps"

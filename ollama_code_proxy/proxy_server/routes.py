@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Body
+from fastapi import APIRouter, HTTPException, Depends, Body, Response
 from fastapi.responses import StreamingResponse
 import httpx
 import os
@@ -34,7 +34,8 @@ async def _ollama_proxy_request(
     ollama_endpoint: str,
     settings: Settings,
     json_data: Optional[Dict[str, Any]] = None,
-    params_data: Optional[Dict[str, Any]] = None
+    params_data: Optional[Dict[str, Any]] = None,
+    expected_empty_response_status: Optional[int] = None
 ) -> Any:
     full_ollama_url = f"{settings.ollama_base_url}{ollama_endpoint}"
     try:
@@ -47,7 +48,15 @@ async def _ollama_proxy_request(
                 response = await client.request("DELETE", full_ollama_url, json=json_data, params=params_data)
             else:
                 raise HTTPException(status_code=501, detail=f"Unsupported proxy method: {method}")
+
             response.raise_for_status()
+
+            if expected_empty_response_status and response.status_code == expected_empty_response_status:
+                return Response(status_code=expected_empty_response_status)
+
+            if not response.content and (200 <= response.status_code <= 299):
+                 return Response(status_code=response.status_code)
+
             return response.json()
     except httpx.HTTPStatusError as e:
         error_detail = str(e)
@@ -93,7 +102,7 @@ async def _stream_ollama_response(
 # --- API Endpoints ---
 @router.post("/generate")
 async def proxy_generate(request: OllamaRequest, settings: Settings = Depends(get_settings)):
-    request_payload_dict = request.model_dump(exclude_unset=True)
+    request_payload_dict = request.model_dump(exclude_unset=True, by_alias=True)
     if request.prompt and settings.prompt_prefix and settings.prompt_prefix.strip():
         request_payload_dict["prompt"] = settings.prompt_prefix + request.prompt
 
@@ -101,15 +110,7 @@ async def proxy_generate(request: OllamaRequest, settings: Settings = Depends(ge
     if request.stream:
         return StreamingResponse(_stream_ollama_response(ollama_target_url, request_payload_dict), media_type="application/x-ndjson")
     else:
-        # For non-streaming, FastAPI will use OllamaResponse (if specified in decorator, or by type hint if not overridden)
-        # If this route's response_model is not set, FastAPI infers from return type annotation.
-        # To be explicit for non-streaming: return OllamaResponse(**await _ollama_proxy_request(...))
-        # However, _ollama_proxy_request already returns a dict, which FastAPI can validate.
-        # For clarity with OpenAPI, explicitly setting response_model=OllamaResponse for non-streaming
-        # would require two separate endpoints or more complex response model logic.
-        # For now, client needs to know what to expect based on stream flag.
         return await _ollama_proxy_request("POST", "/api/generate", settings, json_data=request_payload_dict)
-
 
 @router.get("/tags", response_model=TagsResponse)
 async def proxy_tags(settings: Settings = Depends(get_settings)):
@@ -117,30 +118,22 @@ async def proxy_tags(settings: Settings = Depends(get_settings)):
 
 @router.post("/show", response_model=ShowResponse)
 async def proxy_show(request: ShowRequest, settings: Settings = Depends(get_settings)):
-    return await _ollama_proxy_request("POST", "/api/show", settings, json_data=request.model_dump(exclude_unset=True))
+    return await _ollama_proxy_request("POST", "/api/show", settings, json_data=request.model_dump(exclude_unset=True, by_alias=True))
 
 @router.post("/chat")
 async def proxy_chat(request: ChatRequest, settings: Settings = Depends(get_settings)):
-    request_payload_dict = request.model_dump(exclude_unset=True)
+    request_payload_dict = request.model_dump(exclude_unset=True, by_alias=True)
     ollama_target_url = f"{settings.ollama_base_url}/api/chat"
     if request.stream:
         return StreamingResponse(_stream_ollama_response(ollama_target_url, request_payload_dict), media_type="application/x-ndjson")
     else:
-        # Similar to /generate, non-streaming should ideally map to ChatResponse.
         return await _ollama_proxy_request("POST", "/api/chat", settings, json_data=request_payload_dict)
 
 @router.post("/pull")
 async def proxy_pull(request: PullRequest, settings: Settings = Depends(get_settings)):
-    request_payload_dict = request.model_dump(exclude_unset=True)
+    request_payload_dict = request.model_dump(exclude_unset=True, by_alias=True)
     ollama_target_url = f"{settings.ollama_base_url}/api/pull"
-
-    # Pull API by default streams. If stream=False, it returns a single status line.
-    # Our PullRequest model has stream: Optional[bool] = True.
     if request.stream is False:
-        # Ollama's non-streaming response for pull is a single JSON object e.g. {"status":"success"}
-        # It's not well-documented for non-streaming, but usually a simple status.
-        # Let's assume it could be a PullStatus or a generic success.
-        # For simplicity, _ollama_proxy_request will return the dict.
         return await _ollama_proxy_request("POST", "/api/pull", settings, json_data=request_payload_dict)
     else:
         return StreamingResponse(
@@ -148,6 +141,60 @@ async def proxy_pull(request: PullRequest, settings: Settings = Depends(get_sett
             media_type="application/x-ndjson"
         )
 
-# Placeholder for other routes
-# @router.delete("/delete") ...
-# etc.
+@router.delete("/delete")
+async def proxy_delete(request: DeleteRequest, settings: Settings = Depends(get_settings)):
+    return await _ollama_proxy_request(
+        method="DELETE",
+        ollama_endpoint="/api/delete",
+        settings=settings,
+        json_data=request.model_dump(exclude_unset=True, by_alias=True),
+        expected_empty_response_status=200
+    )
+
+@router.get("/ps", response_model=PsResponse)
+async def proxy_ps(settings: Settings = Depends(get_settings)):
+    return await _ollama_proxy_request(
+        method="GET",
+        ollama_endpoint="/api/ps",
+        settings=settings
+    )
+
+@router.get("/version", response_model=VersionResponse)
+async def proxy_version(settings: Settings = Depends(get_settings)):
+    return await _ollama_proxy_request(
+        method="GET",
+        ollama_endpoint="/api/version",
+        settings=settings
+    )
+
+@router.post("/copy")
+async def proxy_copy(request: CopyRequest, settings: Settings = Depends(get_settings)):
+    return await _ollama_proxy_request(
+        method="POST",
+        ollama_endpoint="/api/copy",
+        settings=settings,
+        json_data=request.model_dump(exclude_unset=True, by_alias=True),
+        expected_empty_response_status=200
+    )
+
+@router.post("/embed", response_model=EmbedResponse)
+async def proxy_embed(request: EmbedRequest, settings: Settings = Depends(get_settings)):
+    return await _ollama_proxy_request(
+        method="POST",
+        ollama_endpoint="/api/embed",
+        settings=settings,
+        json_data=request.model_dump(exclude_unset=True, by_alias=True)
+    )
+
+@router.post("/create")
+async def proxy_create(request: CreateRequest, settings: Settings = Depends(get_settings)):
+    request_payload_dict = request.model_dump(exclude_unset=True, by_alias=True)
+    ollama_target_url = f"{settings.ollama_base_url}/api/create"
+
+    if request.stream is False:
+        return await _ollama_proxy_request("POST", "/api/create", settings, json_data=request_payload_dict)
+    else:
+        return StreamingResponse(
+            _stream_ollama_response(ollama_target_url, request_payload_dict),
+            media_type="application/x-ndjson"
+        )
