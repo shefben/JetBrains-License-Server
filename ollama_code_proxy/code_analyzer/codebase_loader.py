@@ -1,230 +1,253 @@
 import os
-from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Tuple, Optional, Callable, Any # Added Any
+import networkx as nx
 
-from .parser import PythonParser # Assuming parser.py is in the same directory
-from .models import ModuleInfo   # Assuming models.py is in the same directory
-
-# Supported languages and their default extensions
-SUPPORTED_LANGUAGES = {
-    "python": [".py"]
-}
+from .parser import PythonParser
+from .models import ModuleInfo
+from .reference_resolver import ReferenceResolver
+from .knowledge_graph import KnowledgeGraph
 
 class CodebaseLoader:
-    """
-    Discovers, loads, and parses code files from a specified directory.
-    It uses language-specific parsers to analyze the files and stores
-    the structured information.
-    """
-    def __init__(self,
-                 supported_languages: Optional[Dict[str, List[str]]] = None,
-                 progress_callback: Optional[callable] = None):
-        """
-        Initializes the CodebaseLoader.
-
-        Args:
-            supported_languages: A dictionary mapping language names to lists of file extensions.
-                                 Defaults to Python (.py) files.
-            progress_callback: An optional function that can be called to report progress
-                               (e.g., progress_callback(filepath, index, total_files)).
-        """
-        self.supported_languages = supported_languages or SUPPORTED_LANGUAGES
+    def __init__(
+        self,
+        codebase_root: str,
+        parser: Optional[PythonParser] = None,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None
+    ):
+        self.codebase_root = os.path.abspath(codebase_root)
+        self.parser = parser if parser else PythonParser()
         self.progress_callback = progress_callback
-        self.parsed_modules: List[ModuleInfo] = []
-        # In a more advanced scenario, parsers could be dynamically loaded based on language.
-        # For now, we'll hardcode PythonParser for simplicity as it's the only one implemented.
-        self.parsers = {
-            "python": PythonParser()
-        }
 
-    def load_from_directory(self, directory_path: str, excluded_dirs: Optional[List[str]] = None, excluded_files: Optional[List[str]] = None) -> None:
-        """
-        Loads and parses all supported code files from the given directory and its subdirectories.
+        self.loaded_modules: Dict[str, ModuleInfo] = {}
+        self.parsing_errors: List[Dict[str, Any]] = []
+        self.knowledge_graph: Optional[nx.DiGraph] = None
 
-        Args:
-            directory_path: The root directory to start scanning for code files.
-            excluded_dirs: A list of directory names to exclude (e.g., ['.git', 'venv', '__pycache__']).
-                           Defaults to common exclusions.
-            excluded_files: A list of file names or patterns to exclude.
-        """
-        self.parsed_modules = [] # Reset before loading
-
-        if excluded_dirs is None:
-            excluded_dirs = ['.git', 'venv', '__pycache__', 'node_modules', '.vscode', '.idea']
-        if excluded_files is None:
-            excluded_files = [] # Add any specific files like 'setup.py' if needed by default
-
-        root_path = Path(directory_path)
-        if not root_path.is_dir():
-            raise ValueError(f"Provided path '{directory_path}' is not a valid directory.")
-
-        # First pass: collect all files to process for accurate progress reporting
-        files_to_process = []
-        for lang_name, extensions in self.supported_languages.items():
-            if lang_name not in self.parsers:
-                # print(f"Warning: No parser available for language '{lang_name}'. Skipping.")
-                continue
-            for ext in extensions:
-                for filepath in root_path.rglob(f"*{ext}"):
-                    if self._is_excluded(filepath, root_path, excluded_dirs, excluded_files):
-                        continue
-                    files_to_process.append(filepath)
-
-        total_files = len(files_to_process)
-        for i, filepath in enumerate(files_to_process):
-            lang_name = self._get_language_from_extension(filepath.suffix)
-            if not lang_name: # Should not happen if collected correctly
-                continue
-
-            if self.progress_callback:
-                try:
-                    self.progress_callback(str(filepath), i + 1, total_files)
-                except Exception as e: # Don't let callback errors stop processing
-                    print(f"Error in progress_callback for {filepath}: {e}")
-
-            try:
-                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                    code = f.read()
-
-                parser = self.parsers[lang_name]
-                parsed_data = parser.parse(code) # This returns a Dict
-
-                # Construct ModuleInfo object
-                module_info = ModuleInfo(
-                    module_name=filepath.stem, # Use filename without extension as module name
-                    filepath=str(filepath.relative_to(root_path)), # Store relative path
-                    language=lang_name, # Add language to ModuleInfo if it's part of the model
-                    docstring=parsed_data.get("docstring"), # Assuming parser extracts module docstring
-                    imports=parsed_data.get("imports", []),
-                    functions=parsed_data.get("functions", []),
-                    classes=parsed_data.get("classes", []),
-                    variables=parsed_data.get("variables", []),
-                    parse_errors= [parsed_data["error"]] if "error" in parsed_data else []
-                )
-                # Note: The PythonParser currently returns a dict where errors are at the top level.
-                # The ModuleInfo model expects parse_errors as a list.
-                # We need to adapt this if the parser directly returns ModuleInfo or if ModuleInfo's
-                # fields directly match the parser's output structure for elements like functions, classes etc.
-                # For now, we are mapping fields. This also means PythonParser needs to be updated
-                # to provide module-level docstring and a clearer error structure if ModuleInfo is to be
-                # built this way.
-                # Let's assume for now the parser's output dict has keys that match ModuleInfo fields.
-
-                self.parsed_modules.append(module_info)
-
-            except Exception as e:
-                print(f"Error processing file {filepath}: {e}")
-                # Optionally, create a ModuleInfo with error information
-                error_module = ModuleInfo(
-                    module_name=filepath.stem,
-                    filepath=str(filepath.relative_to(root_path)),
-                    language=lang_name,
-                    parse_errors=[{"error": f"Failed to read or parse file: {str(e)}", "details": str(e)}]
-                )
-                self.parsed_modules.append(error_module)
-
-
-    def _is_excluded(self, filepath: Path, root_path: Path, excluded_dirs: List[str], excluded_files: List[str]) -> bool:
-        """Checks if a file or its parent directories are in the exclusion lists."""
-        # Check against excluded directory names anywhere in the path
-        try:
-            relative_path_parts = filepath.relative_to(root_path).parts
-        except ValueError: # filepath is not under root_path, should not happen with rglob
-            return True
-
-        for part in relative_path_parts[:-1]: # Check directory parts
-            if part in excluded_dirs:
+    def _is_excluded(self, current_item_abs_path: str, item_name: str, is_dir: bool,
+                     effective_exclude_dirs: List[str], effective_exclude_files: List[str]) -> bool:
+        if is_dir:
+            if item_name in effective_exclude_dirs or item_name.startswith('.'): # Exclude hidden directories
                 return True
-
-        # Check against excluded file names
-        if filepath.name in excluded_files:
-            return True
-
-        # Add more sophisticated pattern matching for excluded_files if needed (e.g., using fnmatch)
+            try:
+                relative_path = os.path.relpath(current_item_abs_path, self.codebase_root)
+                if relative_path == ".": return False
+                for part in relative_path.split(os.sep):
+                    if part in effective_exclude_dirs or part.startswith('.'): # Check parts for exclusion
+                        return True
+            except ValueError:
+                return True
+        else: # File
+            if item_name in effective_exclude_files or item_name.startswith('.'): # Exclude hidden files
+                return True
         return False
 
-    def _get_language_from_extension(self, extension: str) -> Optional[str]:
-        """Gets the language name from a file extension."""
-        for lang, exts in self.supported_languages.items():
-            if extension.lower() in exts:
-                return lang
-        return None
+    def load_analyze_and_build_graph(
+        self,
+        exclude_dirs: Optional[List[str]] = None,
+        exclude_files: Optional[List[str]] = None
+    ) -> None:
+        if not os.path.isdir(self.codebase_root):
+            raise ValueError(f"Codebase path {self.codebase_root} is not a valid directory.")
 
-    def get_all_modules(self) -> List[ModuleInfo]:
-        """Returns all parsed ModuleInfo objects."""
-        return self.parsed_modules
+        default_exclude_dirs = [
+            'venv', '.venv', 'env', '.env', '__pycache__', '.git', '.hg', '.svn',
+            'node_modules', 'target', 'build', 'dist', 'docs', 'site-packages',
+            'lib', 'lib64', 'test', 'tests', 'tmp', 'temp',
+            '.pytest_cache', '.mypy_cache', '*.egg-info'
+        ]
+        effective_exclude_dirs = exclude_dirs if exclude_dirs is not None else default_exclude_dirs
 
-    def get_module_by_filepath(self, relative_filepath: str) -> Optional[ModuleInfo]:
-        """Retrieves a parsed module by its relative filepath."""
-        for module in self.parsed_modules:
-            if module.filepath == relative_filepath:
-                return module
-        return None
+        default_exclude_files = ['.DS_Store', '*.pyc', '*.pyo', '*.pyd', '*.so', 'setup.py', 'conftest.py']
+        effective_exclude_files = exclude_files if exclude_files is not None else default_exclude_files
+
+        self.loaded_modules = {}
+        self.parsing_errors = []
+        self.knowledge_graph = None
+
+        filepaths_to_parse: List[str] = []
+        for root, dirs, files in os.walk(self.codebase_root, topdown=True):
+            dirs[:] = [d for d in dirs if not self._is_excluded(os.path.abspath(os.path.join(root, d)), d, True, effective_exclude_dirs, effective_exclude_files)]
+
+            for file_name in files:
+                abs_filepath = os.path.abspath(os.path.join(root, file_name))
+                if file_name.endswith(".py") and not self._is_excluded(abs_filepath, file_name, False, effective_exclude_dirs, effective_exclude_files):
+                    filepaths_to_parse.append(abs_filepath)
+
+        total_files = len(filepaths_to_parse)
+        current_phase_msg = "Parsing files"
+        if self.progress_callback: self.progress_callback(0, total_files, current_phase_msg)
+
+        for i, abs_filepath in enumerate(filepaths_to_parse):
+            if self.progress_callback:
+                self.progress_callback(i + 1, total_files, f"{current_phase_msg}")
+
+            raw_parsed_data = self.parser.parse(abs_filepath)
+
+            parser_errors = raw_parsed_data.get("parse_errors", [])
+            if parser_errors:
+                for err_detail in parser_errors:
+                     self.parsing_errors.append({
+                        "filepath": abs_filepath,
+                        "error": err_detail.get("message", "Unknown parsing error from parser"),
+                        "lineno": err_detail.get("lineno"), "offset": err_detail.get("offset"),
+                        "text": err_detail.get("text", "")
+                    })
+
+            if any(err.get("type") == "FileAccessError" for err in parser_errors):
+                continue
+
+            try:
+                # Ensure 'filepath' in raw_parsed_data is relative for ModuleInfo object
+                # The parser returns absolute path in its "filepath" field.
+                parser_fp = raw_parsed_data.get("filepath")
+                if parser_fp and os.path.isabs(parser_fp):
+                     raw_parsed_data["filepath"] = os.path.relpath(parser_fp, self.codebase_root)
+                elif not parser_fp : # If parser somehow didn't set it
+                     raw_parsed_data["filepath"] = os.path.relpath(abs_filepath, self.codebase_root)
+
+
+                module_info = ModuleInfo(**raw_parsed_data)
+                self.loaded_modules[abs_filepath] = module_info
+            except Exception as e:
+                self.parsing_errors.append({
+                    "filepath": abs_filepath, "error": f"Failed to create ModuleInfo from parsed data: {str(e)}",
+                    "lineno": None, "offset": None, "text": ""
+                })
+
+        if self.progress_callback: self.progress_callback(total_files, total_files, "Parsing complete. Resolving references...")
+
+        if self.loaded_modules:
+            resolver = ReferenceResolver(all_modules=self.loaded_modules, codebase_root=self.codebase_root)
+            resolver.resolve_all_references()
+            if self.progress_callback: self.progress_callback(total_files, total_files, "Reference resolution complete. Building graph...")
+
+            kg_builder = KnowledgeGraph(all_modules=self.loaded_modules, codebase_root=self.codebase_root)
+            self.knowledge_graph = kg_builder.get_graph()
+            if self.progress_callback: self.progress_callback(total_files, total_files, "Knowledge graph built.")
+
+        if self.progress_callback: self.progress_callback(total_files, total_files, "Analysis complete.")
+
+    def get_module(self, filepath: str) -> Optional[ModuleInfo]:
+        return self.loaded_modules.get(os.path.abspath(filepath))
+
+    def get_all_modules(self) -> Dict[str, ModuleInfo]:
+        return self.loaded_modules
+
+    def get_parsing_errors(self) -> List[Dict[str, Any]]:
+        return self.parsing_errors
+
+    def get_knowledge_graph(self) -> Optional[nx.DiGraph]:
+        return self.knowledge_graph
 
 if __name__ == '__main__':
-    # Example Usage (for demonstration)
+    import sys
+    import shutil
+    project_root_for_example = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root_for_example not in sys.path:
+        sys.path.insert(0, project_root_for_example)
 
-    # Define a simple progress callback
-    def my_progress_reporter(filepath, current, total):
-        print(f"Processing ({current}/{total}): {filepath}")
+    from ollama_code_proxy.code_analyzer.parser import PythonParser
+    from ollama_code_proxy.code_analyzer.models import ModuleInfo
+    from ollama_code_proxy.code_analyzer.reference_resolver import ReferenceResolver
+    from ollama_code_proxy.code_analyzer.knowledge_graph import KnowledgeGraph
 
-    # Create a loader instance
-    loader = CodebaseLoader(progress_callback=my_progress_reporter)
 
-    # Create dummy files and directory structure for testing
-    # In a real scenario, this path would be an existing codebase.
-    dummy_project_path = Path("_temp_dummy_project")
+    print("Running CodebaseLoader __main__ example with KG integration...")
 
-    if not dummy_project_path.exists():
-        dummy_project_path.mkdir()
-        (dummy_project_path / "module1.py").write_text(
-            "import os\\n\\ndef func1():\\n    pass\\n\\nclass ClassA:\\n    def method_a(self):\\n        return os.name"
-        )
-        (dummy_project_path / "module2.py").write_text(
-            "def func2(x, y):\\n    return x + y\\n\\nMY_VAR = 100"
-        )
-        sub_dir = dummy_project_path / "subdir"
-        sub_dir.mkdir()
-        (sub_dir / "module3.py").write_text(
-            "from ..module1 import func1 # Relative import\\n\\ndef func3():\\n    func1()"
-        )
-        # Add an excluded directory and file
-        excluded_dir_path = dummy_project_path / "venv"
-        excluded_dir_path.mkdir()
-        (excluded_dir_path / "some_venv_file.py").write_text("pass")
-        (dummy_project_path / ".env").write_text("SECRET=123") # Example of an excluded file if we add it
+    test_root = os.path.abspath("temp_loader_kg_test_project")
+    if os.path.exists(test_root): shutil.rmtree(test_root)
+    module_a_path = os.path.join(test_root, "module_a.py")
+    pkg_dir = os.path.join(test_root, "pkg")
+    module_b_path = os.path.join(pkg_dir, "module_b.py")
+    pkg_init_path = os.path.join(pkg_dir, "__init__.py")
 
-    print(f"Loading from: {dummy_project_path.resolve()}")
+    os.makedirs(pkg_dir, exist_ok=True)
+
+    with open(module_a_path, "w", encoding="utf-8") as f:
+        f.write("""
+from pkg.module_b import func_b, ClassB
+from .pkg import module_b # This import might be problematic for simple resolver if module_a is top-level
+import os
+
+class MyClassA: pass
+
+def func_a1():
+    x = ClassB()
+    y = MyClassA()
+    return func_b(os.sep)
+
+def func_a2():
+    return module_b.func_b("test")
+""")
+    with open(module_b_path, "w", encoding="utf-8") as f:
+        f.write("""
+from ..module_a import MyClassA
+
+class ClassB:
+    def method_b(self):
+        a = MyClassA()
+        return "method_b_called"
+
+def func_b(param):
+    c = ClassB()
+    return c.method_b() + str(param)
+""")
+    with open(pkg_init_path, "w", encoding="utf-8") as f: f.write("from .module_b import ClassB, func_b")
+
+    def simple_progress(cur, total, phase):
+        print(f"Progress: {phase} - {cur}/{total}")
+
+    loader = CodebaseLoader(codebase_root=test_root, progress_callback=simple_progress)
     try:
-        loader.load_from_directory(str(dummy_project_path), excluded_files=['.env'])
+        print(f"\nLoading codebase at: {test_root}")
+        loader.load_analyze_and_build_graph(
+            exclude_dirs=['.git', '.venv', 'test_excluded_dir'],
+            exclude_files=['excluded_file.py']
+        )
 
-        all_modules = loader.get_all_modules()
-        print(f"\\nFound and parsed {len(all_modules)} modules:")
-        for mod_info in all_modules:
-            print(f"  Module: {mod_info.module_name} ({mod_info.filepath})")
-            if mod_info.functions:
-                print(f"    Functions: {', '.join([f.name for f in mod_info.functions])}")
-            if mod_info.classes:
-                print(f"    Classes: {', '.join([c.name for c in mod_info.classes])}")
-            if mod_info.variables:
-                print(f"    Variables: {', '.join([v.name for v in mod_info.variables])}")
-            if mod_info.parse_errors:
-                print(f"    Parse Errors: {mod_info.parse_errors}")
+        print(f"\n--- Loaded {len(loader.get_all_modules())} modules ---")
+        for abs_path, mod_info in loader.get_all_modules().items():
+            print(f"\nModule: {mod_info.module_name} (Rel Path: {mod_info.filepath})")
+            if mod_info.imports:
+                for imp in mod_info.imports:
+                    print(f"  Import: name='{imp.name}', module='{imp.module}', level={imp.level}, Resolved: {imp.resolved_filepath}")
 
-        mod1_path = "module1.py" # Relative path
-        retrieved_mod1 = loader.get_module_by_filepath(mod1_path)
-        if retrieved_mod1:
-            print(f"\\nRetrieved module by path '{mod1_path}': {retrieved_mod1.module_name}")
+            for func in mod_info.functions:
+                print(f"  Function: {func.name}")
+                for call in func.function_calls:
+                    print(f"    Call: '{call.target_name}', RP: {call.resolved_target_filepath}, RN: {call.resolved_target_name}")
+                for inst in func.instance_creations:
+                    print(f"    Instance: '{inst.class_name}', RP: {inst.resolved_target_filepath}")
+
+            for cls in mod_info.classes:
+                 print(f"  Class: {cls.name}")
+                 if cls.resolved_bases:
+                     for base in cls.resolved_bases:
+                         print(f"    Base: '{base['name']}', RP: {base['filepath']}")
+                 for meth in cls.methods:
+                    print(f"    Method: {meth.name}")
+                    for call in meth.function_calls:
+                        print(f"      Call: '{call.target_name}', RP: {call.resolved_target_filepath}, RN: {call.resolved_target_name}")
+                    for inst in meth.instance_creations:
+                        print(f"      Instance: '{inst.class_name}', RP: {inst.resolved_target_filepath}")
+
+        kg = loader.get_knowledge_graph()
+        if kg:
+            print(f"\nKnowledge Graph built: {kg.number_of_nodes()} nodes, {kg.number_of_edges()} edges.")
         else:
-            print(f"\\nCould not retrieve module by path '{mod1_path}'")
+            print("\nKnowledge Graph not built (no modules loaded or error).")
 
-    except ValueError as ve:
-        print(f"Error: {ve}")
+        if loader.get_parsing_errors():
+            print("\n--- Parsing Errors Reported by Loader ---")
+            for err in loader.get_parsing_errors():
+                print(f"  File: {err['filepath']}, Line: {err.get('lineno')}, Error: {err['error']}")
+
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        print(f"Error during example: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        # Clean up dummy files (optional, good for testing)
-        import shutil
-        if dummy_project_path.exists():
-             shutil.rmtree(dummy_project_path)
-        pass
+        if os.path.exists(test_root):
+            shutil.rmtree(test_root)
+        print(f"\nCleaned up: {test_root}")
+
+    print("\nCodebaseLoader example finished.")
